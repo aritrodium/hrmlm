@@ -906,7 +906,7 @@ flake8 .
 
 ## Support
 
-- 📖 **Documentation**: [https://github.com/yourusername/hrmlm/wiki](https://github.com/aritrodium/hrmlm/wiki)
+- 📖 **Documentation**: [https://github.com/aritrodium/hrmlm/wiki](https://github.com/aritrodium/hrmlm/wiki)
 - 🐛 **Issues**: [GitHub Issues](https://github.com/aritrodium/hrmlm/issues)
 - 💬 **Discussions**: [GitHub Discussions](https://github.com/aritrodium/hrmlm/discussions)
 
