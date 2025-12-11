@@ -1,16 +1,18 @@
 """
-Hierarchical Recurrent Memory Language Model (HRMLM)
-Implementation of a hierarchical RNN with multi-timescale processing.
+Hierarchical Recurrent Memory Language Model with SFT/DPO support.
+Complete implementation for instruction following and preference optimization.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any, List
+import math
+import warnings
 
 
 class LayerNormGRUCell(nn.Module):
-    """GRU Cell with Layer Normalization."""
+    """GRU Cell with Layer Normalization for stable training."""
     
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
@@ -38,7 +40,19 @@ class LayerNormGRUCell(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         
+        # Initialize weights
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Xavier initialization for better convergence."""
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+    
     def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Forward pass through GRU cell."""
         # Reset gate
         r = torch.sigmoid(
             self.ln_ir(self.W_ir(x)) + 
@@ -70,7 +84,7 @@ class LowLevelRNN(nn.Module):
         self.cell = LayerNormGRUCell(input_dim + hidden_dim, hidden_dim, dropout)
         
     def forward(self, x: torch.Tensor, h_l: torch.Tensor, h_h: torch.Tensor) -> torch.Tensor:
-        # Concatenate input with high-level hidden state
+        """Process input with high-level context."""
         combined = torch.cat([x, h_h], dim=-1)
         return self.cell(combined, h_l)
 
@@ -83,6 +97,7 @@ class HighLevelRNN(nn.Module):
         self.cell = LayerNormGRUCell(input_dim, hidden_dim, dropout)
         
     def forward(self, h_h_prev: torch.Tensor, h_l: torch.Tensor) -> torch.Tensor:
+        """Integrate low-level information."""
         return self.cell(h_l, h_h_prev)
 
 
@@ -90,16 +105,11 @@ class HRMLM(nn.Module):
     """
     Hierarchical Recurrent Memory Language Model.
     
-    Args:
-        vocab_size: Size of vocabulary
-        n_ctx: Context window size (maximum sequence length)
-        n_embd: Embedding dimension
-        n_hidden: Low-level hidden dimension
-        n_high_hidden: High-level hidden dimension
-        T: Number of low-level cycles per step
-        N: Number of high-level cycles per token
-        dropout: Dropout rate
-        layer_norm: Whether to use layer normalization
+    Supports:
+    - Pretraining (causal language modeling)
+    - Supervised Fine-Tuning (SFT)
+    - Direct Preference Optimization (DPO)
+    - Reward modeling
     """
     
     def __init__(self,
@@ -132,7 +142,7 @@ class HRMLM(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(n_high_hidden, vocab_size)
         
-        # Layer normalization for embeddings
+        # Layer normalization
         self.ln_emb = nn.LayerNorm(n_embd) if layer_norm else nn.Identity()
         
         # Dropout
@@ -140,9 +150,9 @@ class HRMLM(nn.Module):
         
         # Initialize weights
         self.apply(self._init_weights)
-        
+    
     def _init_weights(self, module):
-        """Initialize weights using Xavier/Glorot initialization."""
+        """Initialize weights using appropriate methods."""
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.xavier_uniform_(module.weight)
             if isinstance(module, nn.Linear) and module.bias is not None:
@@ -153,32 +163,36 @@ class HRMLM(nn.Module):
     
     def forward(self,
                 input_ids: torch.Tensor,
-                past_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                return_states: bool = False):
+                attention_mask: Optional[torch.Tensor] = None,
+                labels: Optional[torch.Tensor] = None,
+                output_hidden_states: bool = False,
+                return_dict: bool = True):
         """
         Forward pass through HRMLM.
         
         Args:
             input_ids: Input token indices [batch_size, seq_len]
-            past_states: Tuple of (h_l, h_h) from previous forward pass
-            return_states: Whether to return hidden states for next step
+            attention_mask: Attention mask [batch_size, seq_len]
+            labels: Labels for language modeling [batch_size, seq_len]
+            output_hidden_states: Whether to output hidden states
+            return_dict: Whether to return dictionary output
             
         Returns:
-            logits: Output logits [batch_size, seq_len, vocab_size]
-            states: Optional tuple of final hidden states
+            Dict or tuple containing:
+            - logits: Output logits [batch_size, seq_len, vocab_size]
+            - loss: Optional language modeling loss
+            - hidden_states: Optional hidden states
         """
         batch_size, seq_len = input_ids.shape
         
         # Initialize hidden states
-        if past_states is None:
-            device = input_ids.device
-            h_l = torch.zeros(batch_size, self.n_hidden, device=device)
-            h_h = torch.zeros(batch_size, self.n_high_hidden, device=device)
-        else:
-            h_l, h_h = past_states
+        device = input_ids.device
+        h_l = torch.zeros(batch_size, self.n_hidden, device=device)
+        h_h = torch.zeros(batch_size, self.n_high_hidden, device=device)
         
-        # Store all logits
+        # Store all logits and hidden states
         logits_list = []
+        hidden_states_list = [] if output_hidden_states else None
         
         # Process sequence
         for t in range(seq_len):
@@ -199,43 +213,129 @@ class HRMLM(nn.Module):
             # Generate logits for current position
             logits_t = self.output_proj(h_h)
             logits_list.append(logits_t.unsqueeze(1))
+            
+            # Store hidden states if requested
+            if output_hidden_states:
+                hidden_states_list.append(h_h.unsqueeze(1))
         
-        # Combine logits
+        # Combine outputs
         logits = torch.cat(logits_list, dim=1)
         
-        if return_states:
-            return logits, (h_l, h_h)
-        return logits
+        # Calculate loss if labels are provided
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            )
+        
+        # Prepare output
+        if not return_dict:
+            output = (logits,)
+            if loss is not None:
+                output = (loss,) + output
+            if output_hidden_states:
+                hidden_states = torch.cat(hidden_states_list, dim=1) if hidden_states_list else None
+                output = output + (hidden_states,)
+            return output
+        
+        output_dict = {
+            "logits": logits,
+            "loss": loss,
+        }
+        
+        if output_hidden_states:
+            hidden_states = torch.cat(hidden_states_list, dim=1) if hidden_states_list else None
+            output_dict["hidden_states"] = hidden_states
+        
+        return output_dict
     
-    @torch.no_grad()
+    def get_log_probs(self, 
+                      input_ids: torch.Tensor,
+                      attention_mask: Optional[torch.Tensor] = None,
+                      past_key_values: Optional[Tuple] = None,
+                      position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Get log probabilities for DPO training.
+        
+        Args:
+            input_ids: Input token indices
+            attention_mask: Attention mask
+            past_key_values: Past hidden states for generation
+            position_ids: Position indices
+            
+        Returns:
+            Log probabilities [batch_size]
+        """
+        outputs = self(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            return_dict=True
+        )
+        
+        logits = outputs.logits
+        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # Gather log probabilities of input tokens
+        log_probs_selected = torch.gather(
+            log_probs[:, :-1], 
+            dim=2, 
+            index=input_ids[:, 1:].unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            log_probs_selected = log_probs_selected * attention_mask[:, :-1]
+        
+        # Sum log probabilities along sequence dimension
+        sum_log_probs = log_probs_selected.sum(dim=1)
+        
+        return sum_log_probs
+    
     def generate(self,
-                 prompt_ids: torch.Tensor,
+                 input_ids: torch.Tensor,
                  max_length: int = 100,
                  temperature: float = 1.0,
                  top_k: int = 50,
                  top_p: float = 1.0,
-                 eos_token_id: Optional[int] = None):
+                 repetition_penalty: float = 1.0,
+                 do_sample: bool = True,
+                 num_beams: int = 1,
+                 attention_mask: Optional[torch.Tensor] = None,
+                 **kwargs):
         """
         Generate text from prompt.
         
         Args:
-            prompt_ids: Starting tokens [batch_size, seq_len]
+            input_ids: Starting tokens [batch_size, seq_len]
             max_length: Maximum generation length
             temperature: Sampling temperature
             top_k: Top-k sampling parameter
             top_p: Nucleus sampling parameter
-            eos_token_id: Token ID for stopping generation
+            repetition_penalty: Penalty for repeating tokens
+            do_sample: Whether to use sampling
+            num_beams: Number of beams for beam search
+            attention_mask: Attention mask
             
         Returns:
-            generated_ids: Generated token IDs
+            generated_ids: Generated token IDs [batch_size, generated_seq_len]
         """
         self.eval()
-        batch_size = prompt_ids.shape[0]
-        device = prompt_ids.device
         
-        # Initialize with prompt
-        generated_ids = prompt_ids.clone()
-        current_input = prompt_ids
+        if num_beams > 1:
+            return self._beam_search_generate(
+                input_ids, max_length, num_beams,
+                attention_mask, **kwargs
+            )
+        
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Initialize with input
+        generated = input_ids
         
         # Initialize hidden states
         h_l = torch.zeros(batch_size, self.n_hidden, device=device)
@@ -243,38 +343,209 @@ class HRMLM(nn.Module):
         
         for _ in range(max_length):
             # Get logits for last token
-            logits, (h_l, h_h) = self(current_input, (h_l, h_h), return_states=True)
-            next_token_logits = logits[:, -1, :] / temperature
+            with torch.no_grad():
+                x = self.embedding(generated[:, -1])
+                x = self.ln_emb(x)
+                
+                # Hierarchical processing for last token
+                for _ in range(self.N):
+                    for _ in range(self.T):
+                        h_l = self.low_rnn(x, h_l, h_h)
+                    h_h = self.high_rnn(h_h, h_l)
+                
+                logits = self.output_proj(h_h)
+            
+            # Apply repetition penalty
+            if repetition_penalty != 1.0:
+                logits = self._apply_repetition_penalty(logits, generated, repetition_penalty)
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
             
             # Apply top-k filtering
             if top_k > 0:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                next_token_logits[indices_to_remove] = -float('Inf')
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = -float('inf')
             
             # Apply nucleus sampling
             if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 
                 # Remove tokens with cumulative probability above threshold
                 sorted_indices_to_remove = cumulative_probs > top_p
-                # Shift indices to keep first token above threshold
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_token_logits[indices_to_remove] = -float('Inf')
+                logits[indices_to_remove] = -float('inf')
             
             # Sample next token
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            if do_sample:
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
             
             # Append to generated sequence
-            generated_ids = torch.cat([generated_ids, next_token], dim=1)
-            current_input = next_token
-            
-            # Check for EOS token
-            if eos_token_id is not None and (next_token == eos_token_id).any():
-                break
+            generated = torch.cat([generated, next_token], dim=-1)
         
-        return generated_ids
+        return generated
+    
+    def _apply_repetition_penalty(self, logits, generated, penalty):
+        """Apply repetition penalty to logits."""
+        for i in range(generated.shape[0]):
+            for token_id in set(generated[i].tolist()):
+                logits[i, token_id] = logits[i, token_id] / penalty
+        return logits
+    
+    def _beam_search_generate(self, input_ids, max_length, num_beams, attention_mask, **kwargs):
+        """Beam search generation."""
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Initialize beams
+        beam_scores = torch.zeros(batch_size, num_beams, device=device)
+        beam_scores[:, 1:] = -1e9
+        
+        generated = input_ids.unsqueeze(1).repeat(1, num_beams, 1)
+        
+        for step in range(max_length):
+            # Flatten for processing
+            flat_generated = generated.view(batch_size * num_beams, -1)
+            
+            # Get logits
+            with torch.no_grad():
+                # This is simplified - in practice you'd need to manage hidden states per beam
+                outputs = self(flat_generated)
+                next_token_logits = outputs.logits[:, -1, :]
+            
+            # Calculate scores
+            next_token_scores = F.log_softmax(next_token_logits, dim=-1)
+            next_token_scores = next_token_scores + beam_scores.view(-1, 1)
+            
+            # Reshape for beam selection
+            next_token_scores = next_token_scores.view(batch_size, num_beams * self.vocab_size)
+            
+            # Select top beams
+            topk_scores, topk_indices = torch.topk(next_token_scores, num_beams, dim=-1)
+            
+            # Update beams
+            beam_indices = topk_indices // self.vocab_size
+            token_indices = topk_indices % self.vocab_size
+            
+            # Update generated sequences
+            new_generated = []
+            for i in range(batch_size):
+                batch_generated = []
+                for j in range(num_beams):
+                    beam_idx = beam_indices[i, j]
+                    token_idx = token_indices[i, j]
+                    batch_generated.append(
+                        torch.cat([generated[i, beam_idx], token_idx.unsqueeze(0)])
+                    )
+                new_generated.append(torch.stack(batch_generated))
+            
+            generated = torch.stack(new_generated)
+            beam_scores = topk_scores
+        
+        # Return best beam for each batch
+        best_beams = torch.argmax(beam_scores, dim=-1)
+        best_generated = []
+        for i in range(batch_size):
+            best_generated.append(generated[i, best_beams[i]])
+        
+        return torch.stack(best_generated)
+    
+    def save_pretrained(self, save_directory: str):
+        """Save model to directory."""
+        import os
+        os.makedirs(save_directory, exist_ok=True)
+        
+        # Save model weights
+        torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
+        
+        # Save configuration
+        config = {
+            "vocab_size": self.vocab_size,
+            "n_ctx": self.n_ctx,
+            "n_embd": self.n_embd,
+            "n_hidden": self.n_hidden,
+            "n_high_hidden": self.n_high_hidden,
+            "T": self.T,
+            "N": self.N,
+            "dropout": self.dropout.p if isinstance(self.dropout, nn.Dropout) else 0.0,
+            "layer_norm": isinstance(self.ln_emb, nn.LayerNorm)
+        }
+        
+        import json
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path: str):
+        """Load model from pretrained weights."""
+        import os
+        import json
+        
+        # Load configuration
+        config_path = os.path.join(pretrained_model_path, "config.json")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        
+        # Create model
+        model = cls(
+            vocab_size=config["vocab_size"],
+            n_ctx=config.get("n_ctx", 1024),
+            n_embd=config.get("n_embd", 768),
+            n_hidden=config.get("n_hidden", 1024),
+            n_high_hidden=config.get("n_high_hidden", 768),
+            T=config.get("T", 5),
+            N=config.get("N", 3),
+            dropout=config.get("dropout", 0.1),
+            layer_norm=config.get("layer_norm", True)
+        )
+        
+        # Load weights
+        weights_path = os.path.join(pretrained_model_path, "pytorch_model.bin")
+        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        
+        return model
+
+
+class RewardModel(nn.Module):
+    """
+    Reward model for DPO training.
+    Takes the HRMLM and adds a reward head.
+    """
+    
+    def __init__(self, base_model: HRMLM):
+        super().__init__()
+        self.base_model = base_model
+        
+        # Reward head
+        self.reward_head = nn.Sequential(
+            nn.Linear(base_model.n_high_hidden, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 1)
+        )
+    
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        """Forward pass to compute reward scores."""
+        # Get hidden states from base model
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # Use last hidden state for reward prediction
+        last_hidden_state = outputs.hidden_states[:, -1, :] if outputs.hidden_states is not None else outputs.logits[:, -1, :]
+        
+        # Compute reward
+        reward = self.reward_head(last_hidden_state)
+        
+        return reward
