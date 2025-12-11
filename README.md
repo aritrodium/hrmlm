@@ -872,20 +872,14 @@ pytest tests/
 If you use HRMLM in your research, please cite:
 
 ```bibtex
-@software{hrmlm2023,
+@software{hrmlm2025,
   title = {HRMLM: Hierarchical Recurrent Memory Language Model},
   author = {aritrodium},
-  year = {2023},
+  year = {2025},
   url = {https://github.com/aritrodium/hrmlm},
   version = {1.0.0}
 }
 
-@article{hrlm2023,
-  title = {Efficient Language Modeling with Hierarchical Recurrent Networks},
-  author = {aritrodium},
-  journal = {arXiv preprint},
-  year = {2023},
-  url = {https://arxiv.org/abs/XXXX.XXXXX}
 }
 ```
 
